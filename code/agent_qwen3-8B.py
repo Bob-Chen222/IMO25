@@ -1,27 +1,3 @@
-"""
-MIT License
-
-Copyright (c) 2025 Lin Yang, Yichen Huang
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-"""
-
 import os
 from pickle import FALSE
 import sys
@@ -35,92 +11,9 @@ import logging
 # The model to use. "gemini-1.5-flash" is fast and capable.
 #MODEL_NAME = "gemini-1.5-flash-latest" 
 # MODEL_NAME = "gemini-2.5-pro" 
-MODEL_NAME 
-# Use the Generative Language API endpoint, which is simpler for API key auth
-API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
+MODEL_NAME = "Qwen/Qwen3-8B"
 
 # Global variables for logging
-_log_file = None
-original_print = print
-
-def log_print(*args, **kwargs):
-    """
-    Custom print function that writes to both stdout and log file.
-    """
-    # Convert all arguments to strings and join them
-    message = ' '.join(str(arg) for arg in args)
-    
-    # Add timestamp to lines starting with ">>>>>"
-    if message.startswith('>>>>>'):
-        from datetime import datetime
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        message = f"[{timestamp}] {message}"
-    
-    # Print to stdout
-    original_print(message)
-    
-    # Also write to log file if specified
-    if _log_file is not None:
-        _log_file.write(message + '\n')
-        _log_file.flush()  # Ensure immediate writing
-
-# Replace the built-in print function
-print = log_print
-
-def set_log_file(log_file_path):
-    """Set the log file for output."""
-    global _log_file
-    if log_file_path:
-        try:
-            _log_file = open(log_file_path, 'w', encoding='utf-8')
-            return True
-        except Exception as e:
-            print(f"Error opening log file {log_file_path}: {e}")
-            return False
-    return True
-
-def close_log_file():
-    """Close the log file if it's open."""
-    global _log_file
-    if _log_file is not None:
-        _log_file.close()
-        _log_file = None
-
-def save_memory(memory_file, problem_statement, other_prompts, current_iteration, max_runs, solution=None, verify=None):
-    """
-    Save the current state to a memory file.
-    """
-    memory = {
-        "problem_statement": problem_statement,
-        "other_prompts": other_prompts,
-        "current_iteration": current_iteration,
-        "max_runs": max_runs,
-        "solution": solution,
-        "verify": verify,
-        "timestamp": __import__('datetime').datetime.now().isoformat()
-    }
-    
-    try:
-        with open(memory_file, 'w', encoding='utf-8') as f:
-            json.dump(memory, f, indent=2, ensure_ascii=False)
-        print(f"Memory saved to {memory_file}")
-        return True
-    except Exception as e:
-        print(f"Error saving memory to {memory_file}: {e}")
-        return False
-
-def load_memory(memory_file):
-    """
-    Load the state from a memory file.
-    """
-    try:
-        with open(memory_file, 'r', encoding='utf-8') as f:
-            memory = json.load(f)
-        print(f"Memory loaded from {memory_file}")
-        return memory
-    except Exception as e:
-        print(f"Error loading memory from {memory_file}: {e}")
-        return None
 
 step1_prompt = """
 ### Core Instructions ###
@@ -232,19 +125,6 @@ verification_remider = """
 Your task is to act as an IMO grader. Now, generate the **summary** and the **step-by-step verification log** for the solution above. In your log, justify each correct step and explain in detail any errors or justification gaps you find, as specified in the instructions above.
 """
 
-def get_api_key():
-    """
-    Retrieves the Google API key from environment variables.
-    Exits if the key is not found.
-    """
-
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        print("Error: GOOGLE_API_KEY environment variable not set.")
-        print("Please set the variable, e.g., 'export GOOGLE_API_KEY=\"your_api_key\"'")
-        sys.exit(1)
-    return api_key
-
 def read_file_content(filepath):
     """
     Reads and returns the content of a file.
@@ -296,26 +176,15 @@ def build_request_payload(system_prompt, question_prompt, other_prompts=None):
 
     return payload
 
-def send_api_request(api_key, payload):
+def serve_huggingface(payload):
     """
     Sends the request to the Gemini API and returns the response.
     """
-    headers = {
-        "Content-Type": "application/json",
-        "X-goog-api-key": api_key # API key now in header!
-    }
     
     #print("Sending request to Gemini API...")
     try:
-        response = requests.post(API_URL, headers=headers, data=json.dumps(payload))
-        response.raise_for_status()  # Raises an HTTPError for bad responses (4xx or 5xx)
-        return response.json()
+        
     except requests.exceptions.RequestException as e:
-        print(f"Error during API request: {e}")
-        if response.status_code == 400:
-            print(f"Possible reason for 400: Model '{MODEL_NAME}' might not be available or URL is incorrect for your setup.")
-            print(f"Raw API Response (if available): {response.text}")
-        #sys.exit(1)
         raise e
 
 def extract_text_from_response(response_data):
