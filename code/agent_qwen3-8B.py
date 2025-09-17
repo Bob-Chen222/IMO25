@@ -9,48 +9,63 @@ import logging
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from type import List, Dict, Any, Optional
 import torch
+from huggingface_hub import datasets, load_dataset
+from concurrent.futures import ProcessPoolExecutor
 
 # --- CONFIGURATION ---
 # The model to use. "gemini-1.5-flash" is fast and capable.
 #MODEL_NAME = "gemini-1.5-flash-latest" 
 # MODEL_NAME = "gemini-2.5-pro" 
-MODEL_NAME = "Qwen/Qwen3-8B"
+SOLVER_MODEL_NAME = "Qwen/Qwen3-8B"
+VERIFIER_MODEL_NAME = "Qwen/Qwen3-8B"
+SOLVER_NAME = ""
 
-def save_memory(memory_file, problem_statement, other_prompts, current_iteration, max_runs, solution=None, verify=None):
+_log_file = None
+original_print = print
+
+def log_print(*args, **kwargs):
+    return
     """
-    Save the current state to a memory file.
+    Custom print function that writes to both stdout and log file.
     """
-    memory = {
-        "problem_statement": problem_statement,
-        "other_prompts": other_prompts,
-        "current_iteration": current_iteration,
-        "max_runs": max_runs,
-        "solution": solution,
-        "verify": verify,
-        "timestamp": __import__('datetime').datetime.now().isoformat()
-    }
+    # Convert all arguments to strings and join them
+    message = ' '.join(str(arg) for arg in args)
     
-    try:
-        with open(memory_file, 'w', encoding='utf-8') as f:
-            json.dump(memory, f, indent=2, ensure_ascii=False)
-        print(f"Memory saved to {memory_file}")
-        return True
-    except Exception as e:
-        print(f"Error saving memory to {memory_file}: {e}")
-        return False
+    # Add timestamp to lines starting with ">>>>>"
+    if message.startswith('>>>>>'):
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        message = f"[{timestamp}] {message}"
+    
+    # Print to stdout
+    original_print(message)
+    
+    # Also write to log file if specified
+    if _log_file is not None:
+        _log_file.write(message + '\n')
+        _log_file.flush()  # Ensure immediate writing
 
-def load_memory(memory_file):
-    """
-    Load the state from a memory file.
-    """
-    try:
-        with open(memory_file, 'r', encoding='utf-8') as f:
-            memory = json.load(f)
-        print(f"Memory loaded from {memory_file}")
-        return memory
-    except Exception as e:
-        print(f"Error loading memory from {memory_file}: {e}")
-        return None
+# Replace the built-in print function
+print = log_print
+
+def set_log_file(log_file_path):
+    """Set the log file for output."""
+    global _log_file
+    if log_file_path:
+        try:
+            _log_file = open(log_file_path, 'w', encoding='utf-8')
+            return True
+        except Exception as e:
+            print(f"Error opening log file {log_file_path}: {e}")
+            return False
+    return True
+
+def close_log_file():
+    """Close the log file if it's open."""
+    global _log_file
+    if _log_file is not None:
+        _log_file.close()
+        _log_file = None
 
 # Global variables for logging
 
@@ -207,41 +222,46 @@ def read_file_content(filepath):
         print(f"Error reading file '{filepath}': {e}")
         sys.exit(1)
 
-def build_request_payload(system_prompt, question_prompt, other_prompts=None):
+def build_request_payloads(system_prompt, question_prompts, other_prompts=None):
     """
     Builds the JSON payload for the Gemini API request, using the
     recommended multi-turn format to include a system prompt.
     """
-    payload = {
-        "systemInstruction": {
-            "role": "system",
-            "parts": [
+
+    payloads = []
+    for question_prompt in question_prompts:
+        
+        payload = {
+            "systemInstruction": {
+                "role": "system",
+                "parts": [
+                {
+                    "text": system_prompt 
+                }
+                ]
+            },
+        "contents": [
             {
-                "text": system_prompt 
+            "role": "user",
+            "parts": [{"text": question_prompt}]
             }
-            ]
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "topP": 1.0,
+            "thinkingConfig": { "thinkingBudget": 32768} 
         },
-       "contents": [
-        {
-          "role": "user",
-          "parts": [{"text": question_prompt}]
         }
-      ],
-      "generationConfig": {
-        "temperature": 0.1,
-        "topP": 1.0,
-        "thinkingConfig": { "thinkingBudget": 32768} 
-      },
-    }
 
-    if other_prompts:
-        for prompt in other_prompts:
-            payload["contents"].append({
-                "role": "user",
-                "parts": [{"text": prompt}]
-            })
+        if other_prompts:
+            for prompt in other_prompts:
+                payload["contents"].append({
+                    "role": "user",
+                    "parts": [{"text": prompt}]
+                })
+        payloads.append(payload)
 
-    return payload
+    return payloads
 
 def _payload_to_messages(payload: Dict[str, Any]) -> List[Dict[str, str]]:
     """
@@ -293,19 +313,16 @@ def _messages_to_prompt_with_template(tokenizer, messages: List[Dict[str, str]])
     lines.append("<|assistant|>\n")  # cue the model to respond
     return "\n".join(lines)
 
-def serve_huggingface(payload: Dict[str, Any], model_name: str = MODEL_NAME, max_new_tokens: int = 4096) -> str:
+def serve(payloads: List[Dict[str, Any]], model_name: str, max_new_tokens: int = 4096, batch_size=10) -> str:
     """
     Generate a chat response locally using Hugging Face Transformers.
     - Respects temperature/topP from payload["generationConfig"] when present.
     - Uses the model's chat template if available.
     """
     # Parse generation config
-    gen_cfg = payload.get("generationConfig", {}) or {}
+    gen_cfg = payloads[0].get("generationConfig", {}) or {}
     temperature: float = float(gen_cfg.get("temperature", 0.1))
     top_p: float = float(gen_cfg.get("topP", 1.0))
-
-    # Prepare messages
-    messages = _payload_to_messages(payload)
 
     # Load model + tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
@@ -316,317 +333,237 @@ def serve_huggingface(payload: Dict[str, Any], model_name: str = MODEL_NAME, max
         trust_remote_code=True,
     )
 
-    # Build prompt
-    prompt = _messages_to_prompt_with_template(tokenizer, messages)
+    # Prepare messages
+    prompts_batched = []
+    for i in range(len(payloads), batch_size):
+        payloads_batched = payloads[i * batch_size: (i + 1) * batch_size]
+        prompts = []
+        for payload in payloads_batched:
+            message = _payload_to_messages(payload)
+            _messages_to_prompt_with_template(tokenizer, message)
+            prompts.append(message)
+        prompts_batched.append(prompts)
 
     # Tokenize
-    inputs = tokenizer(prompt, return_tensors="pt")
+    inputs_batched = []
+    for prompts in prompts_batched:
+        inputs = tokenizer(prompts, return_tensors="pt")
+        inputs_batched.append(inputs)
+
     if torch.cuda.is_available():
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        inputs_batched= {k: v.to(model.device) for k, v in inputs_batched.items()}
 
     # Sampling flags (temperature<=0 → greedy)
     do_sample = temperature is not None and float(temperature) > 0.0
 
-    output_ids = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
-        temperature=max(1e-6, float(temperature)) if do_sample else None,
-        top_p=float(top_p) if do_sample else None,
-        pad_token_id=tokenizer.eos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
+    output_batched = []
+    for inputs in inputs_batched:
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=max(1e-6, float(temperature)) if do_sample else None,
+            top_p=float(top_p) if do_sample else None,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        output_batched.append((inputs, output_ids))
+
 
     # Slice off the prompt to get only new tokens
-    gen_ids = output_ids[0, inputs["input_ids"].shape[-1]:]
-    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-    return text.strip()
+    text_batched = []
+    for outputs in output_batched:
+        for output_ids in outputs:
+            gen_ids = output_ids[0, inputs["input_ids"].shape[-1]:]
+            text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            text_batched.append(text.strip())
+             
+    return text_batched
 
-def extract_text_from_response(response_data):
+def extract_text_from_responses(responses_data, model_name="") -> str:
     """
     Extracts the generated text from the API response JSON.
     Handles potential errors if the response format is unexpected.
     """
-    try:
-        return response_data['candidates'][0]['content']['parts'][0]['text']
-    except (KeyError, IndexError, TypeError) as e:
-        print("Error: Could not extract text from the API response.")
-        print(f"Reason: {e}")
-        print("Full API Response:")
-        print(json.dumps(response_data, indent=2))
-        #sys.exit(1)
-        raise e 
 
-def extract_detailed_solution(solution, marker='Detailed Solution', after=True):
+    if isinstance(responses_data, List[str]):
+        return responses_data
+    else:
+        assert False, "didn't support api call yet"
+        assert "gpt" in model_name.lower()
+        try:
+        # The output is an array, we need to find the message with text content
+            print(">>>>>> Response:")
+            print(json.dumps(response_data, indent=2))
+
+            output_array = response_data['output']
+            for item in output_array:
+                if item['type'] == 'message' and 'content' in item:
+                    content_array = item['content']
+                    for content_item in content_array:
+                        if content_item['type'] == 'output_text':
+                            return content_item['text']
+            
+            # Fallback: if no text found, return empty string
+            return ""
+        except (KeyError, IndexError, TypeError) as e:
+            print("Error: Could not extract text from the API response.")
+            print(f"Reason: {e}")
+            print("Full API Response:")
+            print(json.dumps(response_data, indent=2))
+            #sys.exit(1)
+            raise e  
+
+def extract_detailed_solutions(solutions, marker='```', after=True):
     """
     Extracts the text after '### Detailed Solution ###' from the solution string.
     Returns the substring after the marker, stripped of leading/trailing whitespace.
     If the marker is not found, returns an empty string.
     """
-    idx = solution.find(marker)
-    if idx == -1:
-        return ''
-    if(after):
-        return solution[idx + len(marker):].strip()
-    else:
-        return solution[:idx].strip()
+    detailed_solutions = [] 
+    for solution in solutions:
+        idx = solution.find(marker)
+        if idx == -1:
+            return ''
+        if(after):
+            detailed_solutions.append(solution[idx + len(marker):].strip())
+        else:
+            detailed_solutions.append(solution[:idx].strip())
+    return detailed_solutions
 
-def verify_solution(problem_statement, solution, verbose=True):
+def verify_solutions(problem_statements, solutions, verbose=False):
 
-    dsol = extract_detailed_solution(solution)
+    dsols = extract_detailed_solutions(solutions)
+    newsts = []
+    for problem_statement, dsol in zip(problem_statements, dsols):
+        newst = f"""
 
-    newst = f"""
-======================================================================
-### Problem ###
+        ======================================================================
+        ### Problem ###
 
-{problem_statement}
+        {problem_statement}
 
-======================================================================
-### Solution ###
+        ======================================================================
+        ### Solution ###
 
-{dsol}
+        {dsol}
 
-{verification_reminder}
-"""
+        {verification_reminder}
+        """
+        newsts.append(newst)
     if(verbose):
         print(">>>>>>> Start verification.")
-    p2 = build_request_payload(system_prompt=verification_system_prompt, 
-        question_prompt=newst
+    p2s = build_request_payloads(system_prompt=verification_system_prompt, 
+        question_prompt=newsts
         )
     
     if(verbose):
         print(">>>>>>> Verification prompt:")
-        print(json.dumps(p2, indent=4))
+        print(json.dumps(p2s, indent=4))
 
-    res = serve_huggingface(p2, MODEL_NAME, 4096)
-    out = extract_text_from_response(res) 
+    ress = serve(p2s, VERIFIER_MODEL_NAME, 4096)
+    outs = extract_text_from_responses(ress) 
 
     if(verbose):
         print(">>>>>>> Verification results:")
-        print(json.dumps(out, indent=4))
+        print(json.dumps(outs, indent=4))
 
-    check_correctness = """Response in "yes" or "no". Is the following statement saying the solution is correct, or does not contain critical error or a major justification gap?""" \
-            + "\n\n" + out 
-    prompt = build_request_payload(system_prompt="", question_prompt=check_correctness)
-    r = serve_huggingface(prompt, MODEL_NAME, 4096)
-    o = extract_text_from_response(r) 
+    check_correctness_list = ["""
+    Respond only with "yes" or "no". Does the solution meet the problem requirements and produce correct results for all valid inputs?
+    """   + "\n\n" + out for out in outs]
+    prompts = build_request_payloads(system_prompt="", question_prompt=check_correctness_list)
+    rs = serve(prompts, VERIFIER_MODEL_NAME, 4096)
+    os = extract_text_from_responses(rs) 
 
     if(verbose):
         print(">>>>>>> Is verification good?")
-        print(json.dumps(o, indent=4))
-        
-    bug_report = ""
+        print(json.dumps(os, indent=4))
 
-    if("yes" not in o.lower()):
-        bug_report = extract_detailed_solution(out, "Detailed Verification", False)
-
-        """p2["contents"].append(
-            {"role": "model",
-            "parts": [{"text": bug_report}]
-            }
-        )
-        p2["contents"].append(
-            {"role": "user",
-            "parts": [{"text": check_verification_prompt}]
-            }
-        )
-
+    bug_reports = []
+    os = [o.strip() for o in os]
+    for out, o in zip(outs, os):
+        bug_report = ""
+        if("yes" not in o.lower()):
+            bug_report = extract_detailed_solutions(out, "Summary", False)
+        bug_reports.append(bug_report)
         if(verbose):
-            print(">>>>>>> Review bug report prompt:")
-            print(json.dumps(p2["contents"][-2:], indent=4))
-
-        res = send_api_request(get_api_key(), p2)
-        out = extract_text_from_response(res) 
-    """
-
-    if(verbose):
-        print(">>>>>>>Bug report:")
-        print(json.dumps(bug_report, indent=4))
+            print(">>>>>>>Bug report:")
+            print(json.dumps(bug_report, indent=4))
     
-    return bug_report, o
-
-def check_if_solution_claimed_complete(solution):
-    check_complete_prompt = f"""
-Is the following text claiming that the solution is complete?
-==========================================================
-
-{solution}
-
-==========================================================
-
-Response in exactly "yes" or "no". No other words.
-    """
-
-    p1 = build_request_payload(system_prompt="",    question_prompt=check_complete_prompt)
-    r = serve_huggingface(p1, MODEL_NAME, 4096)
-    o = extract_text_from_response(r)
-
-    print(o)
-    return "yes" in o.lower()
+    return bug_reports, os
+        
 
 
-def init_explorations(problem_statement, verbose=True, other_prompts=[]):
-    p1  = build_request_payload(
+def init_explorations(problem_statements, verbose=True, other_prompts=[]):
+    p1s  = build_request_payloads(
             system_prompt=step1_prompt,
-            question_prompt=problem_statement,
+            question_prompt=problem_statements,
             #other_prompts=["* Please explore all methods for solving the problem, including casework, induction, contradiction, and analytic geometry, if applicable."]
             #other_prompts = ["You may use analytic geometry to solve the problem."]
             other_prompts = other_prompts
         )
 
     print(f">>>>>> Initial prompt.")
-    print(json.dumps(p1, indent=4))
+    print(json.dumps(p1s, indent=4))
 
-    response1 = serve_huggingface(p1, MODEL_NAME, 4096)
-    output1 = extract_text_from_response(response1)
+    response1s = serve(p1s, SOLVER_MODEL_NAME, 4096)
+    output1s = extract_text_from_responses(response1s)
 
     print(f">>>>>>> First solution: ") 
-    print(json.dumps(output1, indent=4))
+    print(json.dumps(output1s, indent=4))
 
     print(f">>>>>>> Self improvement start:")
-    p1["contents"].append(
-        {"role": "model",
-        "parts": [{"text": output1}]
-        }
-    )
-    p1["contents"].append(
-        {"role": "user",
-        "parts": [{"text": self_improvement_prompt}]
-        }
-    )
+    for p1 , output1 in zip(p1s, output1s):
+        p1["contents"].append(
+            {"role": "model",
+            "parts": [{"text": output1}]
+            }
+        )
+        p1["contents"].append(
+            {"role": "user",
+            "parts": [{"text": self_improvement_prompt}]
+            }
+        )
 
-    response2 = serve_huggingface(p1, MODEL_NAME, 4096)
-    solution = extract_text_from_response(response2)
+    response2s = serve(p1s, SOLVER_MODEL_NAME, 4096)
+    solutions = extract_text_from_responses(response2s)
     print(f">>>>>>> Corrected solution: ")
-    print(json.dumps(solution, indent=4))
-    
-    #print(f">>>>>>> Check if solution is complete:"  )
-    #is_complete = check_if_solution_claimed_complete(output1)
-    #if not is_complete:
-    #    print(f">>>>>>> Solution is not complete. Failed.")
-    #    return None, None, None, None
+    print(json.dumps(solutions, indent=4))
     
     print(f">>>>>>> Vefify the solution.")
-    verify, good_verify = verify_solution(problem_statement, solution, verbose)
+    verifys, good_verifys = verify_solutions(problem_statements, solutions, verbose)
 
     print(f">>>>>>> Initial verification: ")
-    print(json.dumps(verify, indent=4))
-    print(f">>>>>>> verify results: {good_verify}")
+    print(json.dumps(verifys, indent=4))
+    print(f">>>>>>> verify results: {good_verifys}")
     
-    return p1, solution, verify, good_verify
+    return p1, solutions, verifys, good_verifys
 
-def agent(problem_statement, other_prompts=[], memory_file=None, resume_from_memory=False):
-    if resume_from_memory and memory_file:
-        # Load memory and resume from previous state
-        memory = load_memory(memory_file)
-        if memory:
-            problem_statement = memory.get("problem_statement", problem_statement)
-            other_prompts = memory.get("other_prompts", other_prompts)
-            current_iteration = memory.get("current_iteration", 0)
-            solution = memory.get("solution", None)
-            verify = memory.get("verify", None)
-            print(f"Resuming from iteration {current_iteration}")
-        else:
-            print("Failed to load memory, starting fresh")
-            current_iteration = 0
-            solution = None
-            verify = None
-    else:
-        # Start fresh
-        current_iteration = 0
-        solution = None
-        verify = None
+def agent(problem_statements, other_prompts=[], memory_file=None, resume_from_memory=False):
     
-    if solution is None:
-        p1, solution, verify, good_verify = init_explorations(problem_statement, True, other_prompts)
-        if(solution is None):
-            print(">>>>>>> Failed in finding a complete solution.")
-            return None
-    else:
-        # We have a solution from memory, need to get good_verify
-        _, good_verify = verify_solution(problem_statement, solution)
-
-    error_count = 0
-    correct_count = 1
-    success = False
-    for i in range(current_iteration, 30):
-        print(f"Number of iterations: {i}, number of corrects: {correct_count}, number of errors: {error_count}")
-
-        if("yes" not in good_verify.lower()):
-            # clear
-            correct_count = 0
-            error_count += 1
-
-            #self improvement
-            print(">>>>>>> Verification does not pass, correcting ...")
-            # establish a new prompt that contains the solution and the verification
-
-            p1 = build_request_payload(
-                system_prompt=step1_prompt,
-                question_prompt=problem_statement,
-                #other_prompts=["You may use analytic geometry to solve the problem."]
-                other_prompts=other_prompts
-            )
-
-            p1["contents"].append(
-                {"role": "model",
-                "parts": [{"text": solution}]
-                }
-            )
-            
-            p1["contents"].append(
-                {"role": "user",
-                "parts": [{"text": correction_prompt},
-                          {"text": verify}]
-                }
-            )
-
-            print(">>>>>>> New prompt:")
-            print(json.dumps(p1, indent=4))
-            response2 = serve_huggingface(p1, MODEL_NAME, 4096)
-            solution = extract_text_from_response(response2)
-
-            print(">>>>>>> Corrected solution:")
-            print(json.dumps(solution, indent=4))
-
-
-            #print(f">>>>>>> Check if solution is complete:"  )
-            #is_complete = check_if_solution_claimed_complete(solution)
-            #if not is_complete:
-            #    print(f">>>>>>> Solution is not complete. Failed.")
-            #    return None
-
-        print(f">>>>>>> Verify the solution.")
-        verify, good_verify = verify_solution(problem_statement, solution)
-
-        if("yes" in good_verify.lower()):
-            print(">>>>>>> Solution is good, verifying again ...")
-            correct_count += 1
-            error_count = 0
- 
-
-        # Save memory every iteration
-        if memory_file:
-            save_memory(memory_file, problem_statement, other_prompts, i, 30, solution, verify)
-        
-        if(correct_count >= 5):
-            print(">>>>>>> Correct solution found.")
-            print(json.dumps(solution, indent=4))
-            return solution
-
-        elif(error_count >= 10):
-            print(">>>>>>> Failed in finding a correct solution.")
-            # Save final state before returning
-            if memory_file:
-                save_memory(memory_file, problem_statement, other_prompts, i, 30, solution, verify)
-            return None
-
-    if(not success):
-        print(">>>>>>> Failed in finding a correct solution.")
-        # Save final state before returning
-        if memory_file:
-            save_memory(memory_file, problem_statement, other_prompts, 30, 30, solution, verify)
+    # Start fresh
+    current_iteration = 0
+    solution = None
+    verify = None
+    
+    p1s, solution, verifys, good_verifys = init_explorations(problem_statements, True, other_prompts)
+    if(solution is None):
+        print(">>>>>>> Failed in finding a complete solution.")
         return None
+
+    # we will just do the first round and see if it's good enough for now
+    for i, good_verify in enumerate(good_verifys):
+        result = 1 if "yes" in good_verify.lower() else 0
+        print(">>>>>>> Found a correct solution.")
+        obj = {
+            "idx": i,
+            "problem_statement": problem_statement,
+            "solution": solution,
+            "verify": verify,
+            "result": result
+        }
+        with open(f"result.jsonl", 'a', encoding='utf-8') as f:
+            f.write(json.dumps(obj) + '\n')
         
 if __name__ == "__main__":
     # Set up argument parsing
@@ -638,6 +575,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_runs", '-m', type=int, default=10, help='Maximum number of runs (default: 10)')
     parser.add_argument('--memory', '-mem', type=str, help='Path to memory file for saving/loading state (optional)')
     parser.add_argument('--resume', '-r', action='store_true', help='Resume from memory file if provided')
+    parser.add_argument('--receipt', '-rec', default='receipt.jsonl', help='Path to receipt file')
     
     args = parser.parse_args()
 
@@ -663,19 +601,35 @@ if __name__ == "__main__":
             sys.exit(1)
         print(f"Logging to file: {args.log}")
     
+    
     problem_statement = read_file_content(args.problem_file)
 
-    for i in range(max_runs):
-        print(f"\n\n>>>>>>>>>>>>>>>>>>>>>>>>>> Run {i} of {max_runs} ...")
-        try:
-            sol = agent(problem_statement, other_prompts, memory_file, resume_from_memory)
-            if(sol is not None):
-                print(f">>>>>>> Found a correct solution in run {i}.")
-                print(json.dumps(sol, indent=4))
-                break
-        except Exception as e:
-            print(f">>>>>>> Error in run {i}: {e}")
-            continue
+    # read receipt file and upload all the problem statement as a list
+    question_ids = set()
+    with open (args.receipt, 'r', encoding='utf-8') as f:
+        obj_0 = json.load(f)
+        dataset = obj_0['dataset']
+        subset = obj_0['subset']
+        split = obj_0['split']
+        # update the set
+        question_ids.add(obj_0['question_id'])
+        for line in f:
+            obj = json.loads(line)
+            question_ids.add(obj['question_id'])
+    
+
+    # load dataset and only keep the ones that are in question_ids
+    ds = load_dataset(dataset, subset, split)
+    filtered_ds = ds.filter(lambda example: example['question_id'] in question_ids)
+    print(f"Loaded {len(filtered_ds)} problems from dataset {dataset}, subset {subset}, split {split}")
+
+
+
+
+
+    # parallelly run agent for each problem
+    results = []
+
     
     # Close log file if it was opened
     close_log_file()
