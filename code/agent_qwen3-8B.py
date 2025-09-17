@@ -6,6 +6,9 @@ from textwrap import indent
 import requests
 import argparse
 import logging
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from type import List, Dict, Any, Optional
+import torch
 
 # --- CONFIGURATION ---
 # The model to use. "gemini-1.5-flash" is fast and capable.
@@ -13,18 +16,52 @@ import logging
 # MODEL_NAME = "gemini-2.5-pro" 
 MODEL_NAME = "Qwen/Qwen3-8B"
 
+def save_memory(memory_file, problem_statement, other_prompts, current_iteration, max_runs, solution=None, verify=None):
+    """
+    Save the current state to a memory file.
+    """
+    memory = {
+        "problem_statement": problem_statement,
+        "other_prompts": other_prompts,
+        "current_iteration": current_iteration,
+        "max_runs": max_runs,
+        "solution": solution,
+        "verify": verify,
+        "timestamp": __import__('datetime').datetime.now().isoformat()
+    }
+    
+    try:
+        with open(memory_file, 'w', encoding='utf-8') as f:
+            json.dump(memory, f, indent=2, ensure_ascii=False)
+        print(f"Memory saved to {memory_file}")
+        return True
+    except Exception as e:
+        print(f"Error saving memory to {memory_file}: {e}")
+        return False
+
+def load_memory(memory_file):
+    """
+    Load the state from a memory file.
+    """
+    try:
+        with open(memory_file, 'r', encoding='utf-8') as f:
+            memory = json.load(f)
+        print(f"Memory loaded from {memory_file}")
+        return memory
+    except Exception as e:
+        print(f"Error loading memory from {memory_file}: {e}")
+        return None
+
 # Global variables for logging
 
 step1_prompt = """
 ### Core Instructions ###
 
-*   **Rigor is Paramount:** Your primary goal is to produce a complete and rigorously justified solution. Every step in your solution must be logically sound and clearly explained. A correct final answer derived from flawed or incomplete reasoning is considered a failure.
-*   **Honesty About Completeness:** If you cannot find a complete solution, you must **not** guess or create a solution that appears correct but contains hidden flaws or justification gaps. Instead, you should present only significant partial results that you can rigorously prove. A partial result is considered significant if it represents a substantial advancement toward a full solution. Examples include:
-    *   Proving a key lemma.
-    *   Fully resolving one or more cases within a logically sound case-based proof.
-    *   Establishing a critical property of the mathematical objects in the problem.
-    *   For an optimization problem, proving an upper or lower bound without proving that this bound is achievable.
-*   **Use TeX for All Mathematics:** All mathematical variables, expressions, and relations must be enclosed in TeX delimiters (e.g., `Let $n$ be an integer.`).
+*   **Correctness is Paramount:** Your primary goal is to produce a valid, executable Python program that fully solves the given problem. Every line of code must be logically sound and consistent with the problem requirements.
+*   **Honesty About Correctness:** If you cannot provide a fully correct solution, do not write code that only looks plausible but contains hidden flaws. Instead, output only significant partial progress that you can rigorously justify. Examples of significant partial progress include:
+    *   Implementing a correct helper function or core algorithmic step.
+    *   Handling one or more cases correctly within a case-based solution.
+    *   Providing a correct algorithmic skeleton with stubs where the missing parts are clearly marked.
 
 ### Output Format ###
 
@@ -35,94 +72,124 @@ Your response MUST be structured into the following sections, in this exact orde
 Provide a concise overview of your findings. This section must contain two parts:
 
 *   **a. Verdict:** State clearly whether you have found a complete solution or a partial solution.
-    *   **For a complete solution:** State the final answer, e.g., "I have successfully solved the problem. The final answer is..."
-    *   **For a partial solution:** State the main rigorous conclusion(s) you were able to prove, e.g., "I have not found a complete solution, but I have rigorously proven that..."
-*   **b. Method Sketch:** Present a high-level, conceptual outline of your solution. This sketch should allow an expert to understand the logical flow of your argument without reading the full detail. It should include:
-    *   A narrative of your overall strategy.
-    *   The full and precise mathematical statements of any key lemmas or major intermediate results.
-    *   If applicable, describe any key constructions or case splits that form the backbone of your argument.
+    *   **For a complete solution:** State the final answer, e.g., “I have successfully solved the problem. The final program is correct and fully functional.”
+    *   **For a partial solution:** State the main rigorous conclusion(s) you were able to implement, e.g., “I have not found a complete solution, but I have rigorously implemented the core dynamic programming routine that computes optimal substructure values.”
+*   **b. Method Sketch:** Present a high-level, conceptual outline of your coding solution. This sketch should allow an expert programmer to understand the logical flow of your algorithm without reading the full code. It should include:
+    *   A narrative of your overall algorithmic strategy.
+    *   The full and precise description of any key subroutines or data structures.
+    *   If applicable, describe how you decomposed the problem (e.g., main loop, helper functions, case splits).
+    *   The entire program must be wrapped as follows: ```<code> ```.
 
 **2. Detailed Solution**
 
-Present the full, step-by-step mathematical proof. Each step must be logically justified and clearly explained. The level of detail should be sufficient for an expert to verify the correctness of your reasoning without needing to fill in any gaps. This section must contain ONLY the complete, rigorous proof, free of any internal commentary, alternative approaches, or failed attempts.
+*   **Present the full Python program. Each part of the code must be logically justified and well-documented with comments. The level of detail should be sufficient for an expert to verify correctness without needing to guess your intentions.
+    *Every function, loop, and conditional should have a clear role tied back to the method sketch.
+    *If the solution is partial, clearly mark unimplemented sections with placeholders (e.g., # TODO) and explain what remains.
+    *No speculative, unverified code is allowed.
+
+
 
 ### Self-Correction Instruction ###
 
-Before finalizing your output, carefully review your "Method Sketch" and "Detailed Solution" to ensure they are clean, rigorous, and strictly adhere to all instructions provided above. Verify that every statement contributes directly to the final, coherent mathematical argument.
+Before finalizing your output, carefully review your "Method Sketch" and "Detailed Solution" to ensure they are clean, rigorous, and strictly adhere to all instructions provided above. Verify that every line of code is correct, executable, and consistent with the described strategy.
 
 """
 
 self_improvement_prompt = """
-You have an opportunity to improve your solution. Please review your solution carefully. Correct errors and fill justification gaps if any. Your second round of output should strictly follow the instructions in the system prompt.
+You have an opportunity to improve your solution. Please review your program carefully. Correct any coding errors, fix logic mistakes, and fill in missing justifications or comments if any. 
+If the solution is incomplete, extend it rigorously or clearly mark unimplemented parts with TODOs. 
+Your revised output must strictly follow the instructions in the system prompt, including wrapping the full program inside ```<code>``` and ensuring every function, loop, and conditional is well-documented and tied back to the method sketch.
 """
 
 check_verification_prompt = """
-Can you carefully review each item in your list of findings? Are they valid or overly strict? An expert grader must be able to distinguish between a genuine flaw and a concise argument that is nonetheless sound, and to correct their own assessment when necessary.
+Can you carefully review each item in your list of identified issues or findings about the program? 
+Are they valid or overly strict? An expert reviewer must be able to distinguish between a genuine coding flaw and a concise implementation that is nonetheless correct, 
+and to correct their own assessment when necessary.
 
-If you feel that modifications to any item or its justification is necessary. Please produce a new list. In your final output, please directly start with **Summary** (no need to justify the new list).
+If you feel that modifications to any item or its justification are necessary, please produce a revised list. 
+In your final output, please directly start with **Summary** (no need to justify the new list separately).
 """
 
 correction_prompt = """
-Below is the bug report. If you agree with certain item in it, can you improve your solution so that it is complete and rigorous? Note that the evaluator who generates the bug report can misunderstand your solution and thus make mistakes. If you do not agree with certain item in the bug report, please add some detailed explanations to avoid such misunderstanding. Your new solution should strictly follow the instructions in the system prompt.
+Below is the bug report. If you agree with certain items in it, improve your program so that it becomes complete, correct, and rigorous. 
+Note that the evaluator who generates the bug report may misunderstand your solution and thus make mistakes. 
+If you do not agree with certain items in the bug report, add detailed comments or explanations in your code to avoid such misunderstanding. 
+Your revised solution must strictly follow the instructions in the system prompt, including wrapping the full program in ```<code>``` and ensuring every part is justified and well-documented.
 """
 
 verification_system_prompt = """
-You are an expert mathematician and a meticulous grader for an International Mathematical Olympiad (IMO) level exam. Your primary task is to rigorously verify the provided mathematical solution. A solution is to be judged correct **only if every step is rigorously justified.** A solution that arrives at a correct final answer through flawed reasoning, educated guesses, or with gaps in its arguments must be flagged as incorrect or incomplete.
+You are an expert programmer and meticulous code reviewer for high-stakes algorithmic tasks. Your primary duty is to rigorously verify the provided Python program against the stated problem. A submission is judged correct **only if it is logically sound, fully executable, and produces correct results for all valid inputs**. Code that reaches the right answer via flawed logic, missing cases, undefined behavior, or luck is **incorrect or incomplete**.
 
 ### Instructions ###
 
-**1. Core Instructions**
-*   Your sole task is to find and report all issues in the provided solution. You must act as a **verifier**, NOT a solver. **Do NOT attempt to correct the errors or fill the gaps you find.**
-*   You must perform a **step-by-step** check of the entire solution. This analysis will be presented in a **Detailed Verification Log**, where you justify your assessment of each step: for correct steps, a brief justification suffices; for steps with errors or gaps, you must provide a detailed explanation.
+**0. Scope & Role**
+- Your sole goal is to determine whether the submitted program is functionally correct for the stated problem. 
+- Ignore style, comments, and code justification; only correctness matters.
 
-**2. How to Handle Issues in the Solution**
-When you identify an issue in a step, you MUST first classify it into one of the following two categories and then follow the specified procedure.
+**1. Bug Identification**
+- A **Bug** is any defect that makes the program produce incorrect results for at least one valid input.  
+  - This includes logic errors, unhandled cases, wrong boundaries, invalid assumptions, or complexity issues that cause the program to fail under stated limits.  
+  - Bugs may be identified either by reasoning about the code or by showing a mismatch between the program and a correct oracle on specific inputs.
 
-*   **a. Critical Error:**
-    This is any error that breaks the logical chain of the proof. This includes both **logical fallacies** (e.g., claiming that `A>B, C>D` implies `A-C>B-D`) and **factual errors** (e.g., a calculation error like `2+3=6`).
-    *   **Procedure:**
-        *   Explain the specific error and state that it **invalidates the current line of reasoning**.
-        *   Do NOT check any further steps that rely on this error.
-        *   You MUST, however, scan the rest of the solution to identify and verify any fully independent parts. For example, if a proof is split into multiple cases, an error in one case does not prevent you from checking the other cases.
+**2. Oracle & Test Suite**
+- Provide a **single shared oracle program**: a minimal, clearly correct reference implementation.  
+- Provide a set of **independent test inputs** that expose the discovered bugs.  
+- Use the following JSON format:
 
-*   **b. Justification Gap:**
-    This is for steps where the conclusion may be correct, but the provided argument is incomplete, hand-wavy, or lacks sufficient rigor.
-    *   **Procedure:**
-        *   Explain the gap in the justification.
-        *   State that you will **assume the step's conclusion is true** for the sake of argument.
-        *   Then, proceed to verify all subsequent steps to check if the remainder of the argument is sound.
+{
+  "program": "<entire runnable oracle program as a single string (no backticks, no markdown)>",
+  "test_inputs": [
+    { "idx": 0, "input_string": "<exact input 0>" },
+    { "idx": 1, "input_string": "<exact input 1>" }
+  ]
+}
 
 **3. Output Format**
-Your response MUST be structured into two main sections: a **Summary** followed by the **Detailed Verification Log**.
+Your response must contain exactly one section: **Summary**.
 
-*   **a. Summary**
-    This section MUST be at the very beginning of your response. It must contain two components:
-    *   **Final Verdict**: A single, clear sentence declaring the overall validity of the solution. For example: "The solution is correct," "The solution contains a Critical Error and is therefore invalid," or "The solution's approach is viable but contains several Justification Gaps."
-    *   **List of Findings**: A bulleted list that summarizes **every** issue you discovered. For each finding, you must provide:
-        *   **Location:** A direct quote of the key phrase or equation where the issue occurs.
-        *   **Issue:** A brief description of the problem and its classification (**Critical Error** or **Justification Gap**).
+**Summary**
+- **Final Verdict**: One sentence stating overall correctness, e.g. “The program is correct.” / “The program is invalid due to Bugs.”  
+- **List of Findings**: Bullet every issue discovered. For each:
+  - **Location**: Quote or pinpoint the relevant code or description.
+  - **Issue**: Concise description (always classified as **Bug**).
+  - **Exposing Input**: Reference the index of the test input from the shared oracle suite that demonstrates the bug.
 
-*   **b. Detailed Verification Log**
-    Following the summary, provide the full, step-by-step verification log as defined in the Core Instructions. When you refer to a specific part of the solution, **quote the relevant text** to make your reference clear before providing your detailed analysis of that part.
+**4. Rigor Rules**
+- No hand-waving: every claim must be tied to the submitted code, the problem specification, or the oracle’s defined behavior.
+- Always use precise language about inputs, outputs, and edge cases.
+- If the problem specification is ambiguous, state the ambiguity and verify under the most standard interpretation(s).
 
-**Example of the Required Summary Format**
-*This is a generic example to illustrate the required format. Your findings must be based on the actual solution provided below.*
+**Example Summary Format (illustrative)**
 
-**Final Verdict:** The solution is **invalid** because it contains a Critical Error.
+Final Verdict: The program is **invalid** due to Bugs in empty input and single-element handling.
 
-**List of Findings:**
-*   **Location:** "By interchanging the limit and the integral, we get..."
-    *   **Issue:** Justification Gap - The solution interchanges a limit and an integral without providing justification, such as proving uniform convergence.
-*   **Location:** "From $A > B$ and $C > D$, it follows that $A-C > B-D$"
-    *   **Issue:** Critical Error - This step is a logical fallacy. Subtracting inequalities in this manner is not a valid mathematical operation.
+List of Findings:
+- Location: `if not arr: return 1`  
+  - Issue: **Bug** — The specification defines the empty-input minimum as 0; returning 1 is incorrect.  
+  - Exposed by test input index `0`.
 
+- Location: `for i in range(1, n):`  
+  - Issue: **Bug** — Skips the case `n = 1`, leading to incorrect behavior.  
+  - Exposed by test input index `1`.
+
+**Shared Oracle + Test Suite (JSON format)**
+
+{
+  "program": "<entire runnable oracle program as a single string (no backticks, no markdown)>",
+  "test_inputs": [
+    { "idx": 0, "input_string": "<exact input 0>" },
+    { "idx": 1, "input_string": "<exact input 1>" }
+  ]
+}
 """
 
 
-verification_remider = """
+verification_reminder = """
 ### Verification Task Reminder ###
 
-Your task is to act as an IMO grader. Now, generate the **summary** and the **step-by-step verification log** for the solution above. In your log, justify each correct step and explain in detail any errors or justification gaps you find, as specified in the instructions above.
+Your task is to act as an expert code reviewer. Generate only the **Summary**. 
+State the final verdict and list all Bugs with their code location, description, and the index of a failing input. 
+If Bugs exist, also return one shared oracle program with a JSON test suite of inputs exposing them.
 """
 
 def read_file_content(filepath):
@@ -176,16 +243,104 @@ def build_request_payload(system_prompt, question_prompt, other_prompts=None):
 
     return payload
 
-def serve_huggingface(payload):
+def _payload_to_messages(payload: Dict[str, Any]) -> List[Dict[str, str]]:
     """
-    Sends the request to the Gemini API and returns the response.
+    Convert your Gemini-style payload into a generic chat message list:
+    [{"role": "system"/"user"/"assistant", "content": "..."}]
     """
-    
-    #print("Sending request to Gemini API...")
-    try:
-        
-    except requests.exceptions.RequestException as e:
-        raise e
+    messages: List[Dict[str, str]] = []
+    # system
+    sys = payload.get("systemInstruction", {}).get("parts", [])
+    if sys and isinstance(sys, list):
+        sys_text = " ".join(p.get("text", "") for p in sys if isinstance(p, dict))
+        if sys_text.strip():
+            messages.append({"role": "system", "content": sys_text.strip()})
+
+    # conversation
+    for turn in payload.get("contents", []):
+        role = turn.get("role", "user")
+        parts = turn.get("parts", [])
+        text = " ".join(p.get("text", "") for p in parts if isinstance(p, dict))
+        if text.strip():
+            # Map unknown roles to user/assistant conservatively
+            if role not in ("system", "user", "assistant"):
+                role = "user"
+            messages.append({"role": role, "content": text.strip()})
+
+    return messages
+
+def _messages_to_prompt_with_template(tokenizer, messages: List[Dict[str, str]]) -> str:
+    """
+    Use tokenizer chat template if available.
+    """
+    # Convert to HF chat format: [{"role": "...", "content": "..."}]
+    # HF expects "role" in {"system","user","assistant"} and "content" string.
+    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    # Fallback: crude concatenation
+    lines = []
+    for m in messages:
+        if m["role"] == "system":
+            lines.append(f"<|system|>\n{m['content']}\n")
+        elif m["role"] == "assistant":
+            lines.append(f"<|assistant|>\n{m['content']}\n")
+        else:
+            lines.append(f"<|user|>\n{m['content']}\n")
+    lines.append("<|assistant|>\n")  # cue the model to respond
+    return "\n".join(lines)
+
+def serve_huggingface(payload: Dict[str, Any], model_name: str = MODEL_NAME, max_new_tokens: int = 4096) -> str:
+    """
+    Generate a chat response locally using Hugging Face Transformers.
+    - Respects temperature/topP from payload["generationConfig"] when present.
+    - Uses the model's chat template if available.
+    """
+    # Parse generation config
+    gen_cfg = payload.get("generationConfig", {}) or {}
+    temperature: float = float(gen_cfg.get("temperature", 0.1))
+    top_p: float = float(gen_cfg.get("topP", 1.0))
+
+    # Prepare messages
+    messages = _payload_to_messages(payload)
+
+    # Load model + tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+
+    # Build prompt
+    prompt = _messages_to_prompt_with_template(tokenizer, messages)
+
+    # Tokenize
+    inputs = tokenizer(prompt, return_tensors="pt")
+    if torch.cuda.is_available():
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    # Sampling flags (temperature<=0 → greedy)
+    do_sample = temperature is not None and float(temperature) > 0.0
+
+    output_ids = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=max(1e-6, float(temperature)) if do_sample else None,
+        top_p=float(top_p) if do_sample else None,
+        pad_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+
+    # Slice off the prompt to get only new tokens
+    gen_ids = output_ids[0, inputs["input_ids"].shape[-1]:]
+    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+    return text.strip()
 
 def extract_text_from_response(response_data):
     """
@@ -231,7 +386,7 @@ def verify_solution(problem_statement, solution, verbose=True):
 
 {dsol}
 
-{verification_remider}
+{verification_reminder}
 """
     if(verbose):
         print(">>>>>>> Start verification.")
@@ -243,7 +398,7 @@ def verify_solution(problem_statement, solution, verbose=True):
         print(">>>>>>> Verification prompt:")
         print(json.dumps(p2, indent=4))
 
-    res = send_api_request(get_api_key(), p2)
+    res = serve_huggingface(p2, MODEL_NAME, 4096)
     out = extract_text_from_response(res) 
 
     if(verbose):
@@ -253,7 +408,7 @@ def verify_solution(problem_statement, solution, verbose=True):
     check_correctness = """Response in "yes" or "no". Is the following statement saying the solution is correct, or does not contain critical error or a major justification gap?""" \
             + "\n\n" + out 
     prompt = build_request_payload(system_prompt="", question_prompt=check_correctness)
-    r = send_api_request(get_api_key(), prompt)
+    r = serve_huggingface(prompt, MODEL_NAME, 4096)
     o = extract_text_from_response(r) 
 
     if(verbose):
@@ -303,7 +458,7 @@ Response in exactly "yes" or "no". No other words.
     """
 
     p1 = build_request_payload(system_prompt="",    question_prompt=check_complete_prompt)
-    r = send_api_request(get_api_key(), p1)
+    r = serve_huggingface(p1, MODEL_NAME, 4096)
     o = extract_text_from_response(r)
 
     print(o)
@@ -322,7 +477,7 @@ def init_explorations(problem_statement, verbose=True, other_prompts=[]):
     print(f">>>>>> Initial prompt.")
     print(json.dumps(p1, indent=4))
 
-    response1 = send_api_request(get_api_key(), p1)
+    response1 = serve_huggingface(p1, MODEL_NAME, 4096)
     output1 = extract_text_from_response(response1)
 
     print(f">>>>>>> First solution: ") 
@@ -340,7 +495,7 @@ def init_explorations(problem_statement, verbose=True, other_prompts=[]):
         }
     )
 
-    response2 = send_api_request(get_api_key(), p1)
+    response2 = serve_huggingface(p1, MODEL_NAME, 4096)
     solution = extract_text_from_response(response2)
     print(f">>>>>>> Corrected solution: ")
     print(json.dumps(solution, indent=4))
@@ -428,7 +583,7 @@ def agent(problem_statement, other_prompts=[], memory_file=None, resume_from_mem
 
             print(">>>>>>> New prompt:")
             print(json.dumps(p1, indent=4))
-            response2 = send_api_request(get_api_key(), p1)
+            response2 = serve_huggingface(p1, MODEL_NAME, 4096)
             solution = extract_text_from_response(response2)
 
             print(">>>>>>> Corrected solution:")
