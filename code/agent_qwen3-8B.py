@@ -318,7 +318,7 @@ def serve(payloads: List[Dict[str, Any]], model_name: str, max_new_tokens: int =
 
     # Prepare messages
     prompts_batched = []
-    for i in range(0, (len(payloads) + batch_size - 1) // batch_size, batch_size):
+    for i in range(0, (len(payloads) + batch_size - 1) // batch_size):
         payloads_prepared = payloads[i * batch_size: (i + 1) * batch_size]
         prompts = []
         for payload in payloads_prepared:
