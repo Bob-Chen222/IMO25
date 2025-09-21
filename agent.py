@@ -34,7 +34,8 @@ async def _request_one(
     messages: Dict[str, Any],
     n: int,
     idx: int,
-    temperature: float = 0.7,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
 ) -> Dict[str, Any]:
     async with sem:
         resp = await client.chat.completions.create(
@@ -51,7 +52,8 @@ async def batch_openai_request(
     data: List[Dict[str, Any]],
     n: int = 1,
     max_concurrency: int = 10,
-    temperature: float = 0.7,
+    temperature: float = 0.1,
+    top_p: float = 1.0,
 ) -> List[Dict[str, List[str]]]:
     sem = asyncio.Semaphore(max_concurrency)
 
@@ -135,10 +137,42 @@ In your final output, please directly start with **Summary** (no need to justify
 """
 
 correction_prompt = """
-Below is the bug report. If you agree with certain items in it, improve your program so that it becomes complete, correct, and rigorous. 
-Note that the evaluator who generates the bug report may misunderstand your solution and thus make mistakes. 
-If you do not agree with certain items in the bug report, add detailed comments or explanations in your code to avoid such misunderstanding. 
-Your revised solution must strictly follow the instructions in the system prompt, including wrapping the full program in ```<code>``` and ensuring every part is justified and well-documented.
+You are given three inputs:
+1. The problem statement.  
+2. The bug report, which critiques your previously generated program and also provides a test suite.  
+3. Your own previously generated program.  
+
+Your task has two required parts:
+
+**Part 1 — Bug Report & Test Case Review**  
+- Identify what in the bug report is correct and genuinely points to necessary improvements.  
+- Identify what in the bug report is incorrect or based on misunderstanding, and explain why it is wrong.  
+- Examine the test cases provided in the bug report:  
+  - Determine which test cases are valid (i.e., they correctly capture edge cases or expected behavior from the problem statement).  
+  - Point out any invalid or misleading test cases and explain why they do not apply.  
+- Always clarify your reasoning to avoid future misunderstanding.   
+
+**Part 2 — Updated Program**  
+- Apply the valid improvements identified in your bug report review.  
+- For issues you rejected, keep your original logic unchanged 
+- Ensure the program is complete, correct, rigorous, and well-documented.  
+- Wrap the entire program in the following format:  
+  ```<code>
+  <full runnable program here>
+  </code>  
+
+### Output Format ###
+
+Your response MUST be structured into the following sections, in this exact order.
+
+**1. Bug Report Review**
+<Write your review here.>
+- Cover: correct items, incorrect items (and why), and validity of each provided test case.
+- Suggestions for what can be further improved regarding the test suites generated.
+
+**2. Detailed Solution**
+*   Always output only the program (complete or partial) inside the code fence ```<code>``` (no other text outside the code fence).
+*   If partial, include clear # TODO: markers where work remains. No speculative stubs—only code that runs or is well-justified. Keep comments tied to the high-level idea.
 """
 
 verification_system_prompt = """
@@ -184,6 +218,9 @@ Your response must contain exactly one section: **Summary**.
 - Always use precise language about inputs, outputs, and edge cases.
 - If the problem specification is ambiguous, state the ambiguity and verify under the most standard interpretation(s).
 
+"""
+
+verification_system_prompt2 = """
 """
 
 
@@ -255,7 +292,7 @@ def build_request_payloads(system_prompt, question_prompts, other_prompts=None):
 
 def _payload_to_message(payload: Dict[str, Any]) -> List[Dict[str, str]]:
     """
-    Convert your Gemini-style payload into a generic chat message list:
+    Convert your payloads into a conversation
     [{"role": "system"/"user"/"assistant", "content": "..."}]
     """
     messages: List[Dict[str, str]] = []
@@ -279,35 +316,14 @@ def _payload_to_message(payload: Dict[str, Any]) -> List[Dict[str, str]]:
 
     return messages
 
-def _messages_to_prompt_with_template(tokenizer, messages: List[Dict[str, str]]) -> str:
+def serve(payloads: List[Dict[str, Any]], model_name: str, max_new_tokens: int = 32768, batch_size=5) -> str:
     """
-    Use tokenizer chat template if available.
+    Generate a chat response either locally or via API
+    - Respects temperature/topP from payload["generationConfig"] when present.
+    - Uses the model's chat template if available.
     """
-    # Convert to HF chat format: [{"role": "...", "content": "..."}]
-    # HF expects "role" in {"system","user","assistant"} and "content" string.
-    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-    # Fallback: crude concatenation
-    lines = []
-    for m in messages:
-        if m["role"] == "system":
-            lines.append(f"<|system|>\n{m['content']}\n")
-        elif m["role"] == "assistant":
-            lines.append(f"<|assistant|>\n{m['content']}\n")
-        else:
-            lines.append(f"<|user|>\n{m['content']}\n")
-    lines.append("<|assistant|>\n")  # cue the model to respond
-    return "\n".join(lines)
-
-def serve(payloads: List[Dict[str, Any]], model_name: str, max_new_tokens: int = 16384, batch_size=5) -> str:
-
     if "gpt" in model_name.lower():
         # Use OpenAI API
-        print("Using OpenAI API for model:", model_name)
         # Convert payloads to OpenAI format
         openai_payloads = []
         for idx, payload in enumerate(payloads):
@@ -327,14 +343,6 @@ def serve(payloads: List[Dict[str, Any]], model_name: str, max_new_tokens: int =
             all_texts.append(text)
         return all_texts
 
-
-
-
-    """
-    Generate a chat response locally using Hugging Face Transformers.
-    - Respects temperature/topP from payload["generationConfig"] when present.
-    - Uses the model's chat template if available.
-    """
     if len(payloads) < batch_size:
         batch_size = len(payloads)
     # Parse generation config
@@ -353,8 +361,6 @@ def serve(payloads: List[Dict[str, Any]], model_name: str, max_new_tokens: int =
         top_p=top_p,
         max_tokens=max_new_tokens,
     ) 
-
-    # Load model + tokenizer
 
     # Prepare messages
     prompts_batched = []
@@ -457,41 +463,27 @@ def verify_solutions(problem_statements, solutions, verbose=False):
         {verification_reminder}
         """
         newsts.append(newst)
-    if(verbose):
-        print(">>>>>>> Start verification.")
+
+    print(">>>>>>> Start verification.")
+
     p2s = build_request_payloads(system_prompt=verification_system_prompt, 
         question_prompts=newsts
         )
     
     assert len(p2s) == len(problem_statements)
-    
-    if(verbose):
-        print(">>>>>>> Verification prompt:")
-        print(json.dumps(p2s, indent=4))
 
-    ress = serve(p2s, VERIFIER_MODEL_NAME)
-
-    outs = extract_text_from_responses(ress) 
-    print("outs: ", outs)
-
-    if(verbose):
-        print(">>>>>>> Verification results:")
-        print(json.dumps(outs, indent=4))
+    outs = serve(p2s, VERIFIER_MODEL_NAME)
 
     check_correctness_list = ["""
     Respond only with "yes" or "no". Does the solution meet the problem requirements and produce correct results for all valid inputs?
     """   + "\n\n" + out for out in outs]
     prompts = build_request_payloads(system_prompt="", question_prompts=check_correctness_list)
-    rs = serve(prompts, VERIFIER_MODEL_NAME)
-    os = extract_text_from_responses(rs)
-
-    if(verbose):
-        print(">>>>>>> Is verification good?")
-        print(json.dumps(os, indent=4))
+    os = serve(prompts, VERIFIER_MODEL_NAME)
 
     bug_reports = []
     os = [o.strip() for o in os]
     bug_reports = extract_detailed_solutions(outs, "Summary", False)
+    print(">>>>>>> Verification done.")
     
     return bug_reports, os
         
@@ -506,8 +498,6 @@ def init_explorations(problem_statements, verbose=False, other_prompts=[]):
             other_prompts = other_prompts
         )
 
-    # print(f">>>>>> Initial prompt.")
-    # print(json.dumps(p1s, indent=4))
     response1s = []
     if os.path.exists("response1s_" + SAFE_MODEL_NAME + ".jsonl"):
         print(">>>>>>> Found existing response1s.jsonl, loading...")
@@ -527,9 +517,6 @@ def init_explorations(problem_statements, verbose=False, other_prompts=[]):
                 f.write(json.dumps(obj) + '\n')
 
     output1s = extract_text_from_responses(response1s)
-
-    # print(f">>>>>>> First solution: ") 
-    # print(json.dumps(output1s, indent=4))
 
     print(f">>>>>>> Self improvement start:")
     for p1 , output1 in zip(p1s, output1s):
@@ -564,19 +551,24 @@ def init_explorations(problem_statements, verbose=False, other_prompts=[]):
 
     print(f">>>>>>> Self improvement done.")
     assert len(response2s) == len(p1s)
-    solutions = extract_text_from_responses(response2s)
+    solutions = response2s
     assert len(solutions) == len(p1s)
-    # print(f">>>>>>> Corrected solution: ")
-    # print(json.dumps(solutions, indent=4))
     
-    print(f">>>>>>> Verify the solution.")
     verifys, good_verifys = verify_solutions(problem_statements, solutions, verbose)
-
-    # print(f">>>>>>> Initial verification: ")
-    # print(json.dumps(verifys, indent=4))
-    # print(f">>>>>>> verify results: {good_verifys}")
     
     return p1, solutions, verifys, good_verifys
+
+def second_round_explorations(problem_statements, solutions, verifys, good_verifys, verbose=False):
+    '''
+    Given the problem statements, bug feedbacks, and verification results,
+    solver will do another round of explorations to improve their own solutions and will give a feedback 
+    based on the verification results
+    '''
+
+    
+
+
+
 
 def agent(problem_statements, other_prompts=[], memory_file=None, resume_from_memory=False):
     
