@@ -137,10 +137,8 @@ In your final output, please directly start with **Summary** (no need to justify
 """
 
 correction_prompt = """
-You are given three inputs:
-1. The problem statement.  
-2. The bug report, which critiques your previously generated program and also provides a test suite.  
-3. Your own previously generated program.  
+You are given a bug report about a Python program that attempts to solve a specific problem
+and you are asked to review the bug report and the program and make necessary corrections to the program.
 
 Your task has two required parts:
 
@@ -150,6 +148,7 @@ Your task has two required parts:
 - Examine the test cases provided in the bug report:  
   - Determine which test cases are valid (i.e., they correctly capture edge cases or expected behavior from the problem statement).  
   - Point out any invalid or misleading test cases and explain why they do not apply.  
+- Point out any issue or bug in the program provided in the bug report
 - Always clarify your reasoning to avoid future misunderstanding.   
 
 **Part 2 — Updated Program**  
@@ -220,9 +219,12 @@ Your response must contain exactly one section: **Summary**.
 
 """
 
-verification_system_prompt2 = """
-"""
-
+verification_correction_prompt = '''
+You are given feedback on your previous bug report and an updated program based on it.  
+If you agree with the feedback, update your bug report to make it correct and rigorous.  
+If you disagree, keep your original logic.  
+Always follow the system prompt instructions in your final solution.  
+'''
 
 verification_reminder = """
 ### Verification Task Reminder ###
@@ -233,6 +235,8 @@ If no Bugs exist, explicitly state “No Bugs identified.”
 Always return one shared oracle program with a JSON test suite of inputs (covering normal, boundary, and edge cases). 
 If Bugs exist, ensure the test suite includes inputs that expose them.
 """
+
+
 
 def read_file_content(filepath):
     """
