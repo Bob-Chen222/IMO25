@@ -236,8 +236,6 @@ Always return one shared oracle program with a JSON test suite of inputs (coveri
 If Bugs exist, ensure the test suite includes inputs that expose them.
 """
 
-
-
 def read_file_content(filepath):
     """
     Reads and returns the content of a file.
@@ -569,6 +567,80 @@ def second_round_explorations(problem_statements, solutions, verifys, good_verif
     based on the verification results
     '''
 
+    p3s = []
+    for i, problem_statement, solution, verify, good_verify in enumerate(zip(problem_statements, solutions, verifys, good_verifys)):
+        p3 = f"""
+
+        ======================================================================
+        ### Problem ###
+
+        {problem_statement}
+
+        ======================================================================
+        ### Previous Solution ###
+
+        {solution}
+
+        ======================================================================
+        ### Verification Feedback ###
+
+        {verify}
+
+        ======================================================================
+
+        {correction_prompt}
+        """
+        p3s.append(p3)
+    
+    # start to serve or check the record
+    response3s = []
+    if os.path.exists("response3s_" + SAFE_MODEL_NAME + ".jsonl"):
+        response3s = []
+        with open("response3s_" + SAFE_MODEL_NAME + ".jsonl", 'r', encoding='utf-8') as f:
+            for line in f:
+                obj = json.loads(line)
+                response3s.append(obj['response'])
+    else:
+        response3s = serve(build_request_payloads(system_prompt=step1_prompt, question_prompts=p3s), SOLVER_MODEL_NAME)
+        with open("response3s_" + SAFE_MODEL_NAME + ".jsonl", 'a', encoding='utf-8') as f:
+            for idx, (p3, response3) in enumerate(zip(p3s, response3s)):
+                obj = {
+                    "idx": idx,
+                    "prompt": p3,
+                    "response": response3
+                }
+                f.write(json.dumps(obj) + '\n')
+
+    solutions = response3s
+    
+    print(f">>>>>>> Second round exploration done.")
+    # verify again
+    p4s = build_request_payloads(system_prompt=verification_system_prompt, question_prompts=p3s)
+    for p4, response3 in zip(p4s, response3s):
+        p4["contents"].append(
+            {"role": "user",
+            "parts": [{"text": response3}]
+            }
+        )
+        p4["contents"].append(
+            {"role": "user",
+            "parts": [{"text": check_verification_prompt}]
+            }
+        )
+    
+    outs = serve(p4s, VERIFIER_MODEL_NAME)
+
+    check_correctness_list = ["""
+    Respond only with "yes" or "no". Does the solution meet the problem requirements and produce correct results for all valid inputs?
+    """   + "\n\n" + out for out in outs]
+    prompts = build_request_payloads(system_prompt="", question_prompts=check_correctness_list)
+    os = serve(prompts, VERIFIER_MODEL_NAME)
+    bug_reports = []
+    os = [o.strip() for o in os]
+    bug_reports = extract_detailed_solutions(outs, "Summary", False)
+    print(">>>>>>> Verification done.")
+    return solutions, bug_reports, os
+
     
 
 
@@ -578,26 +650,57 @@ def agent(problem_statements, other_prompts=[], memory_file=None, resume_from_me
     
     # Start fresh
     current_iteration = 0
-    solution = None
-    verify = None
-    
-    p1s, solution, verifys, good_verifys = init_explorations(problem_statements, False, other_prompts)
-    if(solution is None):
-        print(">>>>>>> Failed in finding a complete solution.")
-        return None
+    solutions = None
+    verifys = None
+    good_verifys = None
 
-    # we will just do the first round and see if it's good enough for now
-    for i, (verify, good_verify) in enumerate(zip(verifys, good_verifys)):
-        result = 1 if "yes" in good_verify.lower() else 0
-        obj = {
-            "idx": i,
-            "problem_statement": problem_statement,
-            "solution": solution,
-            "verify": verify,
-            "result": result
-        }
-        with open(f"final_res_" + SAFE_MODEL_NAME + ".jsonl", 'a', encoding='utf-8') as f:
-            f.write(json.dumps(obj) + '\n')
+
+    
+    if os.path.exists("final_res_" + SAFE_MODEL_NAME + ".jsonl"):
+        print(">>>>>>> Found existing final_res.jsonl, loading...")
+        with open("final_res_" + SAFE_MODEL_NAME + ".jsonl", 'r', encoding='utf-8') as f:
+            for line in f:
+                obj = json.loads(line)
+                solutions.append(obj['solution'])
+                verifys.append(obj['verify'])
+    else:   
+        p1s, solutions, verifys, good_verifys = init_explorations(problem_statements, False, other_prompts)
+
+        for i, (verify, good_verify) in enumerate(zip(verifys, good_verifys)):
+            result = 1 if "yes" in good_verify.lower() else 0
+            obj = {
+                "idx": i,
+                "problem_statement": problem_statement,
+                "solution": solutions[i],
+                "verify": verify,
+                "result": result
+            }
+            with open(f"final_res_" + SAFE_MODEL_NAME + ".jsonl", 'a', encoding='utf-8') as f:
+                f.write(json.dumps(obj) + '\n')
+
+
+    if os.path.exists("final_res_2_" + SAFE_MODEL_NAME + ".jsonl"):
+        print(">>>>>>> Found existing final_res_2.jsonl, loading...")
+        with open("final_res_2_" + SAFE_MODEL_NAME + ".jsonl", 'r', encoding='utf-8') as f:
+            for line in f:
+                obj = json.loads(line)
+                solutions.append(obj['solution'])
+                verifys.append(obj['verify'])
+    else:
+    # start the second round explorations
+        solutions2, bug_reports, good_verifys = second_round_explorations(problem_statements, solutions, verifys, good_verifys)
+        for i, (verify, good_verify) in enumerate(zip(bug_reports, good_verifys)):
+            result = 1 if "yes" in good_verify.lower() else 0
+            obj = {
+                "idx": i,
+                "problem_statement": problem_statement,
+                "solution": solutions2[i],
+                "verify": verify,
+                "result": result
+            }
+            with open(f"final_res_2_" + SAFE_MODEL_NAME + ".jsonl", 'a', encoding='utf-8') as f:
+                f.write(json.dumps(obj) + '\n')
+
         
 if __name__ == "__main__":
     # Set up argument parsing
